@@ -15,6 +15,12 @@ which stores everything in Supabase Postgres -> web and mobile stay in sync.
    - Against local backend (Android emulator): `flutter run --dart-define=API_BASE=http://10.0.2.2:8000`
    - Real phone + local backend: use your PC's LAN IP, e.g. `--dart-define=API_BASE=http://192.168.1.5:8000`
      (plain http needs `android:usesCleartextTraffic="true"` on <application> for debug only)
+  ## Download
+  [Download RakshaPay for Android]
+  
+  (https://github.com/rohanb-21/RakshaPay-Mobile/releases/latest/download/RakshaPay.apk)
+  
+  Demo only: please use fake names and phone numbers.
 
 Apply the backend changes first (see chat reply), otherwise /api/transfer and /api/user/me won't accept the JWT.
 
