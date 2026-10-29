@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'package:crypto/crypto.dart';
 import 'dart:convert';
 import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -24,10 +24,29 @@ class Api {
   static const _secure = FlutterSecureStorage();
   static String? token;
   static late String deviceId;
+  static bool hasPin = false;
+
+  /// Id of the signed-in user, read from the login token (its "sub" field).
+  static int? get userId => _idFromToken(token);
+
+  static int? _idFromToken(String? t) {
+    if (t == null) return null;
+    try {
+      final parts = t.split('.');
+      final payload = utf8.decode(base64Url.decode(base64Url.normalize(parts[1])));
+      return int.tryParse('${(jsonDecode(payload) as Map)['sub']}');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Storage key for one account's MPIN data, so every account keeps its own MPIN.
+  static String _pk(String name, [int? uid]) => '${name}_${uid ?? userId}';
 
   static Future<void> init() async {
     token = await _secure.read(key: 'token');
-    hasPin = await _secure.containsKey(key: 'pin_hash');
+    await _migrateLegacyPin();
+    hasPin = userId != null && await _secure.containsKey(key: _pk('pin_hash'));
     final p = await SharedPreferences.getInstance();
     var id = p.getString('device_id');
     if (id == null) {
@@ -36,6 +55,21 @@ class Api {
       await p.setString('device_id', id);
     }
     deviceId = id;
+  }
+
+  /// Older app versions stored one shared MPIN. Move it to the signed-in account.
+  static Future<void> _migrateLegacyPin() async {
+    final uid = userId;
+    if (uid == null) return;
+    final hash = await _secure.read(key: 'pin_hash');
+    final salt = await _secure.read(key: 'pin_salt');
+    if (hash == null || salt == null) return;
+    await _secure.write(key: _pk('pin_hash', uid), value: hash);
+    await _secure.write(key: _pk('pin_salt', uid), value: salt);
+    await _secure.write(key: _pk('pin_fails', uid), value: '0');
+    await _secure.delete(key: 'pin_hash');
+    await _secure.delete(key: 'pin_salt');
+    await _secure.delete(key: 'pin_fails');
   }
 
   static Map<String, String> _headers({bool auth = false}) => {
@@ -103,10 +137,13 @@ class Api {
   static Future<Map<String, dynamic>> login(String email, String password) =>
       _post('/api/login', {'email': email, 'password': password, 'device_id': deviceId});
 
-  static Future<void> verifyOtp(int userId, String otp) async {
-    final d = await _post('/api/verify-otp', {'user_id': userId, 'otp': otp});
+  static Future<void> verifyOtp(int uid, String otp) async {
+    final d = await _post('/api/verify-otp', {'user_id': uid, 'otp': otp});
     token = d['token'] as String;
     await _secure.write(key: 'token', value: token);
+    // This account may already have an MPIN saved on this phone.
+    hasPin = await _secure.containsKey(key: _pk('pin_hash'));
+    if (hasPin) await _secure.write(key: _pk('pin_fails'), value: '0');
   }
 
   static Future<Map<String, dynamic>> me() => _get('/api/user/me', auth: true);
@@ -115,19 +152,24 @@ class Api {
       _post('/api/transfer', {'amount': amount, 'recipient': recipient, 'device_id': deviceId},
           auth: true);
 
-    static Future<void> logout() async {
+  // ── Sign out ────────────────────────────────────────────────
+  /// Normal sign-out keeps the account's MPIN on this phone.
+  /// forgetPin: true also deletes that account's MPIN (Forgot MPIN / too many wrong tries).
+  static Future<void> logout({bool forgetPin = false}) async {
+    final uid = userId; // read before the token is cleared
+    if (forgetPin && uid != null) {
+      await _secure.delete(key: _pk('pin_hash', uid));
+      await _secure.delete(key: _pk('pin_salt', uid));
+      await _secure.delete(key: _pk('pin_fails', uid));
+    }
     token = null;
     hasPin = false;
     await _secure.delete(key: 'token');
-    await _secure.delete(key: 'pin_hash');
-    await _secure.delete(key: 'pin_salt');
-    await _secure.delete(key: 'pin_fails');
   }
 
   // ── MPIN (app lock) ─────────────────────────────────────────
   static const pinLength = 4; // change to 6 for a 6-digit MPIN
   static const maxPinAttempts = 5;
-  static bool hasPin = false;
 
   static String _hashPin(String pin, String salt) =>
       sha256.convert(utf8.encode('$salt:$pin')).toString();
@@ -135,43 +177,32 @@ class Api {
   static Future<void> setPin(String pin) async {
     final r = Random.secure();
     final salt = List.generate(16, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
-    await _secure.write(key: 'pin_salt', value: salt);
-    await _secure.write(key: 'pin_hash', value: _hashPin(pin, salt));
-    await _secure.write(key: 'pin_fails', value: '0');
+    await _secure.write(key: _pk('pin_salt'), value: salt);
+    await _secure.write(key: _pk('pin_hash'), value: _hashPin(pin, salt));
+    await _secure.write(key: _pk('pin_fails'), value: '0');
     hasPin = true;
   }
 
   /// Returns -1 if the MPIN is correct, otherwise the attempts left.
-  /// Returns 0 when too many wrong tries happened: the login is wiped.
+  /// Returns 0 when too many wrong tries happened: the user is signed out
+  /// and this account's MPIN is deleted.
   static Future<int> verifyPin(String pin) async {
-    final salt = await _secure.read(key: 'pin_salt');
-    final hash = await _secure.read(key: 'pin_hash');
+    final salt = await _secure.read(key: _pk('pin_salt'));
+    final hash = await _secure.read(key: _pk('pin_hash'));
     if (salt == null || hash == null) {
-      await logout();
+      await logout(forgetPin: true);
       return 0;
     }
     if (_hashPin(pin, salt) == hash) {
-      await _secure.write(key: 'pin_fails', value: '0');
+      await _secure.write(key: _pk('pin_fails'), value: '0');
       return -1;
     }
-    final fails = (int.tryParse(await _secure.read(key: 'pin_fails') ?? '0') ?? 0) + 1;
+    final fails = (int.tryParse(await _secure.read(key: _pk('pin_fails')) ?? '0') ?? 0) + 1;
     if (fails >= maxPinAttempts) {
-      await logout();
+      await logout(forgetPin: true);
       return 0;
     }
-    await _secure.write(key: 'pin_fails', value: '$fails');
+    await _secure.write(key: _pk('pin_fails'), value: '$fails');
     return maxPinAttempts - fails;
   }
-
-  // ── Admin endpoints (same ones the website's admin panel uses) ──
-  static Future<Map<String, dynamic>> adminStats() => _get('/api/admin/stats');
-
-  static Future<List<Map<String, dynamic>>> adminList(String path) async {
-    final d = await _getJson(path);
-    if (d is! List) throw ApiException('Unexpected response from server.');
-    return d.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-  }
-
-  static Future<void> setSwap(int userId, bool swapped) => _post(
-      swapped ? '/api/admin/simulate-swap' : '/api/admin/reset-swap', {'user_id': userId});
 }

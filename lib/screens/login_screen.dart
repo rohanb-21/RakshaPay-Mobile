@@ -57,8 +57,10 @@ class _LoginScreenState extends State<LoginScreen> {
         builder: (_) => _OtpSheet(userId: d['user_id'] as int, otp: d['otp'] as String, action: action),
       ).then((ok) {
         if (ok == true && mounted) {
-          Navigator.of(context).pushReplacement(
-              MaterialPageRoute(builder: (_) => const PinScreen(mode: PinMode.create)));
+          Navigator.of(context).pushReplacement(MaterialPageRoute(
+              builder: (_) => Api.hasPin
+                  ? const HomeShell()
+                  : const PinScreen(mode: PinMode.create)));
         }
       });
     }

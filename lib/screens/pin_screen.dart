@@ -135,7 +135,7 @@ class _PinScreenState extends State<PinScreen> {
       ),
     );
     if (ok == true) {
-      await Api.logout();
+      await Api.logout(forgetPin: true);
       if (mounted) _goLogin();
     }
   }
